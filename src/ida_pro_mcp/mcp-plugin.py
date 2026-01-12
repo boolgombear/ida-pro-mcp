@@ -7,6 +7,9 @@ if sys.version_info < (3, 11):
 import json
 import struct
 import threading
+import time
+import tempfile
+import errno
 import http.server
 from urllib.parse import urlparse
 from typing import Any, Callable, get_type_hints, TypedDict, Optional, Annotated, TypeVar, Generic, NotRequired
@@ -191,12 +194,16 @@ class MCPHTTPServer(http.server.HTTPServer):
 
 class Server:
     HOST = "localhost"
-    PORT = 13337
+    PORT_START = 13337
+    PORT_RANGE = 64
+    ENDPOINT_DIR = os.path.join(tempfile.gettempdir(), "ida-pro-mcp")
 
     def __init__(self):
         self.server = None
         self.server_thread = None
         self.running = False
+        self.port = None
+        self.endpoint_path = None
 
     def start(self):
         if self.running:
@@ -217,25 +224,88 @@ class Server:
             self.server.server_close()
         if self.server_thread:
             self.server_thread.join()
-            self.server = None
+            self.server_thread = None
+        self.server = None
+        self._cleanup_endpoint_file()
         print("[MCP] Server stopped")
+
+    def _choose_port(self):
+        last_error = None
+        for offset in range(Server.PORT_RANGE):
+            port = Server.PORT_START + offset
+            try:
+                self.server = MCPHTTPServer((Server.HOST, port), JSONRPCRequestHandler)
+                self.port = port
+                return port
+            except OSError as e:
+                last_error = e
+                if e.errno in (errno.EADDRINUSE, 10048):
+                    continue
+                print(f"[MCP] Server error while binding: {e}")
+                return None
+        if last_error is not None:
+            print(f"[MCP] Unable to find a free port for the MCP server: {last_error}")
+        else:
+            print("[MCP] Unable to find a free port for the MCP server")
+        return None
+
+    def _publish_endpoint(self):
+        try:
+            metadata = get_metadata()
+        except Exception as exc:
+            metadata = None
+            print(f"[MCP] Warning: failed to read metadata for endpoint registration: {exc}")
+        try:
+            os.makedirs(Server.ENDPOINT_DIR, exist_ok=True)
+            endpoint_id = f"{os.getpid()}-{self.port}"
+            data = {
+                "id": endpoint_id,
+                "pid": os.getpid(),
+                "host": Server.HOST,
+                "port": self.port,
+                "module": metadata["module"] if metadata else None,
+                "path": metadata["path"] if metadata else None,
+                "base": metadata["base"] if metadata else None,
+                "size": metadata["size"] if metadata else None,
+                "timestamp": time.time(),
+            }
+            self.endpoint_path = os.path.join(Server.ENDPOINT_DIR, f"{endpoint_id}.json")
+            with open(self.endpoint_path, "w", encoding="utf-8") as fp:
+                json.dump(data, fp)
+        except Exception as exc:
+            print(f"[MCP] Warning: failed to write endpoint registration: {exc}")
+
+    def _cleanup_endpoint_file(self):
+        if self.endpoint_path and os.path.exists(self.endpoint_path):
+            try:
+                os.remove(self.endpoint_path)
+            except OSError:
+                pass
+        self.endpoint_path = None
 
     def _run_server(self):
         try:
-            # Create server in the thread to handle binding
-            self.server = MCPHTTPServer((Server.HOST, Server.PORT), JSONRPCRequestHandler)
-            print(f"[MCP] Server started at http://{Server.HOST}:{Server.PORT}")
+            if self._choose_port() is None:
+                self.running = False
+                return
+            assert self.server is not None
+            self._publish_endpoint()
+            print(f"[MCP] Server started at http://{Server.HOST}:{self.port}")
             self.server.serve_forever()
         except OSError as e:
-            if e.errno == 98 or e.errno == 10048:  # Port already in use (Linux/Windows)
-                print("[MCP] Error: Port 13337 is already in use")
-            else:
-                print(f"[MCP] Server error: {e}")
-            self.running = False
+            print(f"[MCP] Server error: {e}")
         except Exception as e:
             print(f"[MCP] Server error: {e}")
         finally:
+            if self.server:
+                try:
+                    self.server.server_close()
+                except Exception:
+                    pass
+            self.server = None
+            self._cleanup_endpoint_file()
             self.running = False
+
 
 # A module that helps with writing thread safe ida code.
 # Based on:
@@ -884,6 +954,17 @@ class DisassemblyLine(TypedDict):
     instruction: str
     comments: NotRequired[list[str]]
 
+class FunctionCall(TypedDict):
+    source_address: str
+    kind: str
+    call_type: NotRequired[str]
+    target_address: NotRequired[str]
+    target_name: NotRequired[str]
+    module: NotRequired[str]
+    target_function: NotRequired[Function]
+    ordinal: NotRequired[int]
+    comment: NotRequired[str]
+
 class Argument(TypedDict):
     name: str
     type: str
@@ -895,6 +976,34 @@ class DisassemblyFunction(TypedDict):
     arguments: NotRequired[list[Argument]]
     stack_frame: list[dict]
     lines: list[DisassemblyLine]
+
+
+def get_xref_type_name(xref_type: int) -> str:
+    try:
+        return ida_xref.get_xref_type_name(xref_type)
+    except AttributeError:
+        return str(xref_type)
+
+IMPORT_LOOKUP: dict[int, tuple[Optional[str], Optional[str], Optional[int]]] = {}
+_IMPORT_CACHE_STATE: dict[str, bool] = {"built": False}
+
+def rebuild_import_lookup(force: bool = False) -> None:
+    """Build a cache of import addresses to module/name tuples"""
+    if _IMPORT_CACHE_STATE.get("built") and not force:
+        return
+    IMPORT_LOOKUP.clear()
+    qty = ida_nalt.get_import_module_qty()
+    for index in range(qty):
+        module_name = ida_nalt.get_import_module_name(index) or f"module_{index}"
+        def callback(ea: int, name: str, ordinal: int) -> bool:
+            IMPORT_LOOKUP[ea] = (
+                module_name,
+                name or None,
+                ordinal if ordinal != 0 else None,
+            )
+            return True
+        ida_nalt.enum_import_names(index, callback)
+    _IMPORT_CACHE_STATE["built"] = True
 
 @jsonrpc
 @idaread
@@ -1010,6 +1119,60 @@ def disassemble_function(
         disassembly_function.update(arguments=arguments)
 
     return disassembly_function
+
+
+@jsonrpc
+@idaread
+def get_function_calls(
+    function_address: Annotated[str, "Address of the function to enumerate call targets for"],
+) -> list[FunctionCall]:
+    """Enumerate direct call targets for the specified function"""
+    address = parse_address(function_address)
+    func = idaapi.get_func(address)
+    if not func:
+        raise IDAError(f"No function found containing address {function_address}")
+    rebuild_import_lookup()
+    calls: list[FunctionCall] = []
+    current_module = idaapi.get_root_filename()
+    for head in idautils.FuncItems(func.start_ea):
+        if not idaapi.is_call_insn(head):
+            continue
+        recorded = False
+        for xref in idautils.XrefsFrom(head, ida_xref.XREF_ALL):
+            target = xref.to
+            entry: FunctionCall = {"source_address": hex(head), "kind": "internal"}
+            call_type = get_xref_type_name(xref.type)
+            if call_type:
+                entry["call_type"] = call_type
+            if idaapi.is_imported_ea(target):
+                module_name, import_name, ordinal = IMPORT_LOOKUP.get(target, (None, None, None))
+                entry["kind"] = "import"
+                entry["target_address"] = hex(target)
+                if import_name:
+                    entry["target_name"] = import_name
+                if module_name:
+                    entry["module"] = module_name
+                if ordinal is not None:
+                    entry["ordinal"] = ordinal
+            else:
+                entry["target_address"] = hex(target)
+                target_name = idaapi.get_name(target)
+                if target_name:
+                    entry["target_name"] = target_name
+                callee = get_function(target, raise_error=False)
+                if callee:
+                    entry["target_function"] = callee
+                if current_module:
+                    entry["module"] = current_module
+            calls.append(entry)
+            recorded = True
+        if not recorded:
+            entry: FunctionCall = {"source_address": hex(head), "kind": "unknown"}
+            comment = idaapi.get_cmt(head, False)
+            if comment:
+                entry["comment"] = comment
+            calls.append(entry)
+    return calls
 
 class Xref(TypedDict):
     address: str
